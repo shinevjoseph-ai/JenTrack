@@ -15,8 +15,8 @@ const app = initializeApp(firebaseConfig);
 const db  = getFirestore(app);
 
 // ── Edit these if you need to rename a different week ────────────
-const OLD_KEY = "2026-W31";
-const NEW_KEY = "2026-W33";
+const OLD_KEY = "2026-W33";
+const NEW_KEY = "2026-W32";
 
 const snap = await getDoc(doc(db, "attendance", "att:business"));
 if (!snap.exists()) {

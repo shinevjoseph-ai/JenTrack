@@ -119,6 +119,47 @@ const getWeekDateRange = (key) => {
   return { monday: iso(monday), sunday: iso(sunday) };
 };
 
+// Shows the actual selected meeting date for a week (from meetingDates), formatted nicely.
+// Falls back to the plain Mon-Sun week label if that meeting hasn't had a date set yet.
+const getMeetingDateOrWeekLabel = (weekKey, weekOffset, meetingDates) => {
+  const meetingDate = meetingDates && meetingDates[weekKey];
+  return meetingDate
+    ? new Date(meetingDate + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })
+    : getWeekLabel(weekOffset);
+};
+
+// Computes the true reporting span for a given meeting week: from the day AFTER the
+// previous meeting's date, through the current meeting's date (inclusive). This widens
+// the span to cover any skipped/postponed weeks in between (14, 21+ days), since
+// contribution data logged during a gap has nowhere else to be reported. Falls back to
+// a single calendar week if there's no previous meeting or no dates have been set yet.
+const computeMeetingSpan = (currentWeek, meetingWeeks, meetingDates, weekOffset) => {
+  const sortedMeetingWeeks = [...meetingWeeks].sort();
+  const curIdx = sortedMeetingWeeks.indexOf(currentWeek);
+  const prevMeetingWeek = curIdx > 0 ? sortedMeetingWeeks[curIdx - 1] : null;
+
+  let spanWeekKeys;
+  if (!meetingWeeks.includes(currentWeek)) {
+    spanWeekKeys = [currentWeek];
+  } else {
+    const curOffset = weekKeyToOffset(currentWeek);
+    const prevOffset = prevMeetingWeek ? weekKeyToOffset(prevMeetingWeek) : curOffset - 1;
+    spanWeekKeys = [];
+    for (let o = prevOffset + 1; o <= curOffset; o++) spanWeekKeys.push(getWeekKey(o));
+  }
+
+  const spanLabel = prevMeetingWeek && meetingDates[prevMeetingWeek] && meetingDates[currentWeek]
+    ? (() => {
+        const dayAfterPrev = new Date(new Date(meetingDates[prevMeetingWeek] + "T00:00:00").getTime() + 86400000);
+        const curDate = new Date(meetingDates[currentWeek] + "T00:00:00");
+        const fmt = (d) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+        return `${fmt(dayAfterPrev)} — ${fmt(curDate)}`;
+      })()
+    : getWeekLabel(weekOffset);
+
+  return { prevMeetingWeek, spanWeekKeys, spanLabel };
+};
+
 const inputStyle = {
   width: "100%", background: "#252836", border: "1px solid #6C63FF55",
   borderRadius: 10, padding: "12px 14px", color: "#F0F0F5",
@@ -173,7 +214,7 @@ const Toggle = ({ checked, onChange }) => (
 );
 
 // ── Week Nav ──────────────────────────────────────────────────────
-const WeekNav = ({ weekOffset, setWeekOffset, meetingWeeks, disabled }) => {
+const WeekNav = ({ weekOffset, setWeekOffset, meetingWeeks, meetingDates, disabled }) => {
   const currentKey = getWeekKey(weekOffset);
   const sorted     = [...(meetingWeeks || [])].sort();
   const idx        = sorted.indexOf(currentKey);
@@ -188,13 +229,20 @@ const WeekNav = ({ weekOffset, setWeekOffset, meetingWeeks, disabled }) => {
     : idx === -1 ? `${getWeekKey(weekOffset)}`
     : `Meeting Week ${idx + 1} of ${sorted.length}`;
 
+  const meetingDate = meetingDates && meetingDates[currentKey];
+  const subtitle = disabled
+    ? "Spans every logged week"
+    : meetingDate
+    ? new Date(meetingDate + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })
+    : getWeekLabel(weekOffset);
+
   return (
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "#1A1D27", borderBottom: "1px solid #2A2D3A", padding: "10px 20px", opacity: disabled ? 0.5 : 1 }}>
       <button onClick={() => hasPrev && jumpToKey(sorted[idx - 1])} disabled={!hasPrev}
         style={{ background: hasPrev ? "#2A2D3A" : "#1A1D27", border: "none", color: hasPrev ? "#F0F0F5" : "#3A3D4A", borderRadius: 8, padding: "6px 14px", fontSize: 16, cursor: hasPrev ? "pointer" : "not-allowed", fontWeight: 700 }}>‹‹</button>
       <div style={{ textAlign: "center" }}>
         <div style={{ fontSize: 13, color: disabled ? "#8888AA" : noMeetings ? "#F59E0B" : "#F0F0F5", fontWeight: 700 }}>📅 {label}</div>
-        <div style={{ fontSize: 11, color: "#8888AA" }}>{disabled ? "Spans every logged week" : getWeekLabel(weekOffset)}</div>
+        <div style={{ fontSize: 11, color: "#8888AA" }}>{subtitle}</div>
       </div>
       <button onClick={() => hasNext && jumpToKey(sorted[idx + 1])} disabled={!hasNext}
         style={{ background: hasNext ? "#2A2D3A" : "#1A1D27", border: "none", color: hasNext ? "#F0F0F5" : "#3A3D4A", borderRadius: 8, padding: "6px 14px", fontSize: 16, cursor: hasNext ? "pointer" : "not-allowed", fontWeight: 700 }}>››</button>
@@ -400,8 +448,15 @@ const MeetingDateModal = ({ weekKey, pendingDate, setPendingDate, onConfirm, onC
 };
 
 // ── Bar Chart (weekly trend) ──────────────────────────────────────
-function BarChart({ weeks, records, members, selectedWeek }) {
+function BarChart({ weeks, records, members, selectedWeek, meetingDates }) {
   const max = members.length || 1;
+  const fmtDate = (w) => {
+    const dateStr = (meetingDates && meetingDates[w]) || getWeekDateRange(w).monday;
+    const d = new Date(dateStr + "T00:00:00");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mmm = d.toLocaleDateString("en-IN", { month: "short" }).toUpperCase();
+    return `${dd}/${mmm}`;
+  };
   return (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 90, marginTop: 8 }}>
       {weeks.map((w, i) => {
@@ -417,7 +472,7 @@ function BarChart({ weeks, records, members, selectedWeek }) {
               <div style={{ width: "100%", height: `${aPct}%`, background: "#EF4444", minHeight: absent  > 0 ? 3 : 0 }} />
               <div style={{ width: "100%", height: `${pPct}%`, background: isSelected ? "#6C63FF" : "#22C55E", minHeight: present > 0 ? 3 : 0 }} />
             </div>
-            <div style={{ fontSize: 9, color: isSelected ? "#6C63FF" : "#8888AA", fontWeight: isSelected ? 700 : 400 }}>W{w.split("-W")[1]}</div>
+            <div style={{ fontSize: 9, color: isSelected ? "#6C63FF" : "#8888AA", fontWeight: isSelected ? 700 : 400 }}>{fmtDate(w)}</div>
           </div>
         );
       })}
@@ -818,7 +873,7 @@ export default function App() {
     <div style={S}>
       {toast && <Toast t={toast} />}
       <EditModal editUser={editUser} editFields={editFields} setEditFields={setEditFields} setEditUser={setEditUser} saveEdit={saveEdit} sessionRole={session.role} sessionId={session.id} sessionIsSuperAdmin={isSuperAdmin(session)} departments={departments} />
-      <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} />
+      <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} meetingDates={meetingDates} />
       <div style={{ padding: "20px 20px 12px" }}>
         <div style={{ color: "#8888AA", fontSize: 13 }}>Welcome back,</div>
         <H1>{session.name} {session.role === "admin" ? "👑" : session.role === "head_table" ? "🎖️" : ""}</H1>
@@ -845,7 +900,7 @@ export default function App() {
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
                 <div style={{ fontSize: 13, color: "#8888AA", fontWeight: 600 }}>MEETING ATTENDANCE</div>
-                <div style={{ fontSize: 13, color: "#F0F0F5", fontWeight: 700 }}>{getWeekLabel(weekOffset)}</div>
+                <div style={{ fontSize: 13, color: "#F0F0F5", fontWeight: 700 }}>{getMeetingDateOrWeekLabel(currentWeek, weekOffset, meetingDates)}</div>
               </div>
               {[
                 { label: "👑 Admin",      color: "#6C63FF", members: users.filter(u => u.role === "admin"      && u.active !== false) },
@@ -874,7 +929,7 @@ export default function App() {
                   <div style={{ fontSize: 13, color: "#8888AA", fontWeight: 600, marginBottom: 4 }}>
                     {meetingWeeks.includes(getWeekKey(weekOffset)) ? "THIS MEETING" : "SELECTED WEEK"}
                   </div>
-                  <div style={{ fontSize: 11, color: "#8888AA", marginBottom: 12 }}>{getWeekLabel(weekOffset)}</div>
+                  <div style={{ fontSize: 11, color: "#8888AA", marginBottom: 12 }}>{getMeetingDateOrWeekLabel(currentWeek, weekOffset, meetingDates)}</div>
                   <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
                     <Donut present={presentCount} absent={absentCount} unmarked={unmarked} total={activeMembers.length} />
                     <div style={{ flex: 1 }}>
@@ -907,7 +962,7 @@ export default function App() {
                             </div>
                           )}
                         </div>
-                        <BarChart weeks={[...meetingWeeks].sort().slice(safePage * 10, safePage * 10 + 10)} records={records} members={activeMembers} selectedWeek={currentWeek} />
+                        <BarChart weeks={[...meetingWeeks].sort().slice(safePage * 10, safePage * 10 + 10)} records={records} members={activeMembers} selectedWeek={currentWeek} meetingDates={meetingDates} />
                       </>
                     );
                   })()}
@@ -1018,10 +1073,10 @@ export default function App() {
     return (
       <div style={S}>
         {toast && <Toast t={toast} />}
-        <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} />
+        <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} meetingDates={meetingDates} />
         <div style={{ padding: "16px 20px 8px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <H1>✅ Attendance</H1>
-          <div style={{ fontSize: 13, color: "#F0F0F5", fontWeight: 700 }}>{getWeekLabel(weekOffset)}</div>
+          <div style={{ fontSize: 13, color: "#F0F0F5", fontWeight: 700 }}>{getMeetingDateOrWeekLabel(currentWeek, weekOffset, meetingDates)}</div>
         </div>
 
         <div style={{ display: "flex", gap: 6, padding: "0 20px 12px", overflowX: "auto" }}>
@@ -1134,7 +1189,7 @@ export default function App() {
           {attTab === "history" && (
             <>
               <div style={{ fontSize: 13, color: "#8888AA", marginBottom: 14 }}>
-                Week: <b style={{ color: "#F0F0F5" }}>{getWeekLabel(weekOffset)}</b>
+                Week: <b style={{ color: "#F0F0F5" }}>{getMeetingDateOrWeekLabel(currentWeek, weekOffset, meetingDates)}</b>
               </div>
               <Card>
                 <div style={{ fontSize: 14, color: "#8888AA", fontWeight: 600, marginBottom: 12 }}>ALL MEMBERS</div>
@@ -1179,7 +1234,7 @@ export default function App() {
     return (
       <div style={S}>
         {toast && <Toast t={toast} />}
-        <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} disabled={bizView === "matrix" && reportScope === "all"} />
+        <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} meetingDates={meetingDates} disabled={bizView === "matrix" && reportScope === "all"} />
         <div style={{ padding: "16px 20px 8px" }}><H1>💰 Business</H1></div>
         <div style={{ padding: "0 20px" }}>
           <div style={{ display: "flex", gap: 8, marginTop: 14, marginBottom: 14 }}>
@@ -1249,11 +1304,12 @@ export default function App() {
 
                 <Card style={{ padding: 14, marginBottom: 14 }}>
                   {(() => {
-                    const giverWeekTotal = getGiverEntries(business, currentWeek, giver.id).reduce((s, e) => s + (e.amount || 0), 0);
+                    const { spanWeekKeys, spanLabel } = computeMeetingSpan(currentWeek, meetingWeeks, meetingDates, weekOffset);
+                    const giverSpanTotal = spanWeekKeys.reduce((s, w) => s + getGiverEntries(business, w, giver.id).reduce((a, e) => a + (e.amount || 0), 0), 0);
                     return (
                       <div style={{ fontSize: 13, color: "#8888AA", fontWeight: 600, marginBottom: 12 }}>
-                        Total Contribution Made&nbsp;: <span style={{ color: "#22C55E", fontWeight: 800 }}>₹{giverWeekTotal.toLocaleString("en-IN")}</span>
-                        <span style={{ fontSize: 11, color: "#8888AA", fontWeight: 400 }}> &nbsp;({getWeekLabel(weekOffset)})</span>
+                        Total Contribution Made&nbsp;: <span style={{ color: "#22C55E", fontWeight: 800 }}>₹{giverSpanTotal.toLocaleString("en-IN")}</span>
+                        <span style={{ fontSize: 11, color: "#8888AA", fontWeight: 400 }}> &nbsp;({spanLabel})</span>
                       </div>
                     );
                   })()}
@@ -1308,28 +1364,7 @@ export default function App() {
 
           {bizView === "matrix" && (() => {
             const sortedMembers = [...activeMembers].sort((a, b) => (a.slNo || 0) - (b.slNo || 0));
-
-            // Compute the actual reporting span for the currently selected meeting week:
-            // from the day AFTER the previous meeting's date, through the current meeting's
-            // date (inclusive) — not just the single calendar week. This correctly widens
-            // the span to cover any skipped/postponed weeks in between, since contribution
-            // data logged during a gap has nowhere else to be reported.
-            const sortedMeetingWeeks = [...meetingWeeks].sort();
-            const curIdx = sortedMeetingWeeks.indexOf(currentWeek);
-            const prevMeetingWeek = curIdx > 0 ? sortedMeetingWeeks[curIdx - 1] : null;
-
-            const spanWeekKeys = (() => {
-              if (!meetingWeeks.includes(currentWeek)) return [currentWeek]; // not a real meeting week — just itself
-              const curOffset = weekKeyToOffset(currentWeek);
-              const prevOffset = prevMeetingWeek ? weekKeyToOffset(prevMeetingWeek) : curOffset - 1;
-              const keys = [];
-              for (let o = prevOffset + 1; o <= curOffset; o++) keys.push(getWeekKey(o));
-              return keys;
-            })();
-
-            const spanLabel = prevMeetingWeek && meetingDates[prevMeetingWeek] && meetingDates[currentWeek]
-              ? `${new Date(new Date(meetingDates[prevMeetingWeek] + "T00:00:00").getTime() + 86400000).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })} — ${new Date(meetingDates[currentWeek] + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}`
-              : getWeekLabel(weekOffset);
+            const { prevMeetingWeek, spanWeekKeys, spanLabel } = computeMeetingSpan(currentWeek, meetingWeeks, meetingDates, weekOffset);
 
             const getTotalGivenTo = (giverId, recipientId) => {
               let total = 0;
@@ -1633,7 +1668,7 @@ export default function App() {
       {toast && <Toast t={toast} />}
       <EditModal editUser={editUser} editFields={editFields} setEditFields={setEditFields} setEditUser={setEditUser} saveEdit={saveEdit} sessionRole={session.role} sessionId={session.id} sessionIsSuperAdmin={isSuperAdmin(session)} departments={departments} />
       <ViewDetailsModal viewUser={viewUser} setViewUser={setViewUser} onEdit={openEdit} departments={departments} sessionRole={session.role} />
-      <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} />
+      <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} meetingDates={meetingDates} />
       <div style={{ padding: "16px 20px 8px" }}><H1>⚙️ Manage</H1></div>
 
       {/* Sub-tabs */}
@@ -1851,7 +1886,7 @@ export default function App() {
                   });
                 })()}
               </Card>
- 
+
               <MeetingDateModal
                 weekKey={datePickerFor}
                 pendingDate={pendingDate}
