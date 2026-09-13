@@ -532,6 +532,7 @@ export default function App() {
   const [showReceiversOnly, setShowReceiversOnly] = useState(false);
   const [reportScope, setReportScope]     = useState("all"); // all | week
   const [showClearWeekConfirm, setShowClearWeekConfirm] = useState(false);
+  const [confirmUserAction, setConfirmUserAction]       = useState(null); // { uid, type: "disable" | "remove" }
   const [bizAmountInput, setBizAmountInput] = useState({}); // key: `${week}_${giverId}_${recipientId}` -> typed value
   const [editUser, setEditUser]           = useState(null);
   const [viewUser, setViewUser]           = useState(null);
@@ -1026,7 +1027,7 @@ export default function App() {
               const received = mine?.bizReceived || 0;
               return (
                 <Card>
-                  <div style={{ fontSize: 14, color: "#8888AA", fontWeight: 600, marginBottom: 12 }}>MY BUSINESS in GEN</div>
+                  <div style={{ fontSize: 14, color: "#8888AA", fontWeight: 600, marginBottom: 12 }}>MY BUSINESS in JEN</div>
                   <div style={{ display: "flex", gap: 10 }}>
                     <div style={{ flex: 1, background: "#6C63FF11", border: "1px solid #6C63FF33", borderRadius: 10, padding: "12px 10px", textAlign: "center" }}>
                       <div style={{ fontSize: 18 }}>↗</div>
@@ -1805,12 +1806,29 @@ export default function App() {
                       {u.email && <div style={{ fontSize: 11, color: "#8888AA" }}>✉️ {u.email}</div>}
                       {u.department && <div style={{ fontSize: 11, color: "#8888AA" }}>🏢 {u.department}</div>}
                     </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginLeft: 8 }}>
-                      <button onClick={() => setViewUser(u)} style={{ background: "#6C63FF22", color: "#6C63FF", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>👁️ View Details</button>
-                      <button onClick={() => toggleActive(u.id)} style={{ background: u.active === false ? "#22C55E22" : "#F59E0B22", color: u.active === false ? "#22C55E" : "#F59E0B", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
-                        {u.active === false ? "✓ Enable" : "⊘ Disable"}
-                      </button>
-                      <button onClick={() => deleteMember(u.id)} style={{ background: "#EF444420", color: "#EF4444", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>🗑 Remove</button>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6, marginLeft: 8, minWidth: 110 }}>
+                      {confirmUserAction && confirmUserAction.uid === u.id ? (
+                        <>
+                          <div style={{ fontSize: 11, color: confirmUserAction.type === "remove" ? "#EF4444" : "#F59E0B", fontWeight: 700, textAlign: "right", marginBottom: 2 }}>
+                            {confirmUserAction.type === "remove" ? "Remove this member?" : "Disable this member?"}
+                          </div>
+                          <button onClick={() => { confirmUserAction.type === "remove" ? deleteMember(u.id) : toggleActive(u.id); setConfirmUserAction(null); }}
+                            style={{ background: confirmUserAction.type === "remove" ? "#EF4444" : "#F59E0B", color: "#fff", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 700 }}>
+                            {confirmUserAction.type === "remove" ? "Yes, Remove" : "Yes, Disable"}
+                          </button>
+                          <button onClick={() => setConfirmUserAction(null)} style={{ background: "#2A2D3A", color: "#8888AA", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>Cancel</button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => setViewUser(u)} style={{ background: "#6C63FF22", color: "#6C63FF", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>👁️ View Details</button>
+                          <button
+                            onClick={() => u.active === false ? toggleActive(u.id) : setConfirmUserAction({ uid: u.id, type: "disable" })}
+                            style={{ background: u.active === false ? "#22C55E22" : "#F59E0B22", color: u.active === false ? "#22C55E" : "#F59E0B", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
+                            {u.active === false ? "✓ Enable" : "⊘ Disable"}
+                          </button>
+                          <button onClick={() => setConfirmUserAction({ uid: u.id, type: "remove" })} style={{ background: "#EF444420", color: "#EF4444", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>🗑 Remove</button>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>

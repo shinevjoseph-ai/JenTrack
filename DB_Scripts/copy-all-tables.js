@@ -30,6 +30,7 @@ const destDb    = getFirestore(destApp);
 // Update this if your collection name or document keys are different
 const srcCOLLECTION = "attendance";
 const destCOLLECTION = "JENtrack-qa";
+
 const DOC_KEYS = [
   "att:users",
   "att:records",
