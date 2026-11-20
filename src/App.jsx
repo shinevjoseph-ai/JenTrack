@@ -120,6 +120,38 @@ const getWeekDateRange = (key) => {
   return { monday: iso(monday), sunday: iso(sunday) };
 };
 
+// ── Contribution window ───────────────────────────────────────────
+// A meeting's contributions close at 6 PM India time (IST, +05:30) on its meeting date and never reopen
+// for that meeting. The next meeting's contributions stay blocked for 12 hours after that 6 PM, and open
+// once the next meeting has been scheduled (a meeting date set in Manage > Meeting Weeks) and those 12
+// hours are over. A week that is not a scheduled meeting cannot take contributions.
+// The super admin is exempt (see saveRecipientAmount).
+const CONTRIBUTION_CLOSE_HOUR = 18;
+const CONTRIBUTION_PAUSE_HOURS = 12;
+const contributionCutoff = (wk, meetingDates) => {
+  const d = meetingDates && meetingDates[wk];
+  return d ? new Date(`${d}T${String(CONTRIBUTION_CLOSE_HOUR).padStart(2, "0")}:00:00+05:30`) : null;
+};
+const fmtDateTimeIST = (dt) => dt.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+// { closed: false, closesAt } when open; otherwise { closed: true, reason: "unscheduled" | "over" | "pause", ... }
+const contributionStatus = (wk, meetingWeeks, meetingDates) => {
+  const now = Date.now();
+  const sorted = [...(meetingWeeks || [])].sort();
+  const own = contributionCutoff(wk, meetingDates);
+  if (!sorted.includes(wk) || !own) return { closed: true, reason: "unscheduled" };
+  if (now >= own.getTime()) return { closed: true, reason: "over", closedAt: own, isLatest: sorted[sorted.length - 1] === wk };
+  const prevWeek = sorted[sorted.indexOf(wk) - 1];
+  const prevCutoff = prevWeek ? contributionCutoff(prevWeek, meetingDates) : null;
+  if (prevCutoff) {
+    const reopenAt = new Date(prevCutoff.getTime() + CONTRIBUTION_PAUSE_HOURS * 3600 * 1000);
+    if (now < reopenAt.getTime()) return { closed: true, reason: "pause", reopenAt };
+  }
+  return { closed: false, closesAt: own };
+};
+const contributionClosedMessage = (st) =>
+  st.reason === "over" ? `Contributions for this meeting closed at ${fmtDateTimeIST(st.closedAt)}.${st.isLatest ? " Contributions for the next meeting open once it is scheduled." : ""}`
+  : st.reason === "pause" ? `Contributions for this meeting open at ${fmtDateTimeIST(st.reopenAt)}.`
+  : "No meeting is scheduled for this week. Contributions open once a meeting date is set.";
 // Shows the actual selected meeting date for a week (from meetingDates), formatted nicely.
 // Falls back to the plain Mon-Sun week label if that meeting hasn't had a date set yet.
 const getMeetingDateOrWeekLabel = (weekKey, weekOffset, meetingDates) => {
@@ -575,6 +607,7 @@ export default function App() {
   const [newLocation, setNewLocation]     = useState("");
   const [newPhotoUrl, setNewPhotoUrl]     = useState("");
   const [newBizPhotoUrl, setNewBizPhotoUrl] = useState("");
+  const [, setClockTick]                 = useState(0); // re-renders every 30 s so the contribution cut-off applies without a refresh
 
   // ── A save that would have emptied a table was refused: tell the user and reload that table ──
   useEffect(() => {
@@ -586,6 +619,11 @@ export default function App() {
     };
     window.addEventListener("jen:save-blocked", onBlocked);
     return () => window.removeEventListener("jen:save-blocked", onBlocked);
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(() => setClockTick(t => t + 1), 30000);
+    return () => clearInterval(id);
   }, []);
 
   // ── Activity log: keep track of who is signed in, and record sign-in / sign-out ──
@@ -749,6 +787,8 @@ export default function App() {
   };
 
   const saveRecipientAmount = async (week, giverId, recipientId, rawValue) => {
+    const cStatus = contributionStatus(week, meetingWeeks, meetingDates);
+    if (cStatus.closed && !isSuperAdmin(session)) return showToast(contributionClosedMessage(cStatus), "#EF4444");
     const amt = parseInt(rawValue, 10);
     if (rawValue === "" || rawValue == null || isNaN(amt) || amt < 0) return showToast("Enter a valid amount", "#F59E0B");
     const map = getRecipientMap(week, giverId);
@@ -1050,7 +1090,7 @@ export default function App() {
         ) : (
           <select value={selUser} onChange={e => setSelUser(e.target.value)} onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); handleLogin(); } }} style={{ ...inputStyle, marginBottom: 16, color: selUser ? "#F0F0F5" : "#8888AA" }}>
             <option value="">— Choose your name —</option>
-            {users.filter(u => u.id !== "u1" && u.active !== false).map(u => (
+            {users.filter(u => u.id !== "u1" && u.active !== false).sort((a, b) => (a.slNo || 0) - (b.slNo || 0)).map(u => (
               <option key={u.id} value={u.id}>{u.name}{u.role !== "member" ? ` ${roleLabel(u.role)}` : ""}</option>
             ))}
           </select>
@@ -1450,6 +1490,9 @@ export default function App() {
             const typedVal = inputKey && bizAmountInput[inputKey] !== undefined ? bizAmountInput[inputKey] : "";
             const savedAmt = selectedTakerId ? recipientMap[selectedTakerId] : undefined;
             const loggedEntries = takers.filter(t => recipientMap[t.id] > 0);
+            const cStatus = contributionStatus(currentWeek, meetingWeeks, meetingDates);
+            const closedNow = cStatus.closed;
+            const contribClosed = closedNow && !isSuperAdmin(session); // super admin may still edit
 
             return (
               <>
@@ -1563,6 +1606,19 @@ export default function App() {
                       </div>
                     );
                   })()}
+                  {closedNow ? (
+                    <div style={{ background: "#EF444422", border: "1px solid #EF444455", borderRadius: 10, padding: "10px 12px", marginBottom: 12, display: "flex", gap: 10, alignItems: "center" }}>
+                      <span style={{ fontSize: 20 }}>🔒</span>
+                      <div>
+                        <div style={{ fontSize: 13, color: "#EF4444", fontWeight: 700 }}>Contributions are closed</div>
+                        <div style={{ fontSize: 12, color: "#8888AA" }}>
+                          {contributionClosedMessage(cStatus)}{!contribClosed ? " You can still edit as super admin." : ""}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: "#F59E0B", fontWeight: 600, marginBottom: 12 }}>⏰ Entries close at {fmtDateTimeIST(cStatus.closesAt)}</div>
+                  )}
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                     <Label>Taker (recipient)</Label>
                     <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12, color: showReceiversOnly ? "#6C63FF" : "#8888AA", fontWeight: 600 }}>
@@ -1580,7 +1636,10 @@ export default function App() {
                     <div style={{ fontSize: 12, color: "#8888AA", marginBottom: 12 }}>No entries logged for {giver.name.split(" ")[0]} yet this week.</div>
                   )}
 
-                  {selectedTakerId && (
+                  {selectedTakerId && contribClosed && savedAmt > 0 && (
+                    <div style={{ fontSize: 12, color: "#22C55E", fontWeight: 800 }}>✓ Saved: ₹{savedAmt.toLocaleString("en-IN")}</div>
+                  )}
+                  {selectedTakerId && !contribClosed && (
                     <>
                       {savedAmt > 0 && (
                         <div style={{ marginBottom: 8, fontSize: 12, color: "#22C55E", fontWeight: 800 }}>✓ Currently saved: ₹{savedAmt.toLocaleString("en-IN")}</div>
