@@ -1,5 +1,6 @@
+/* global __BUILD_ID__ */
 import { useState, useEffect, useRef } from "react";
-import { load, save, addUserAtomic } from "./firebase";
+import { load, save, addUserAtomic, setAuditActor, logEvent, loadAuditLog } from "./firebase";
 import jenLogo from "./assets/jen-logo.png";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
@@ -128,35 +129,17 @@ const getMeetingDateOrWeekLabel = (weekKey, weekOffset, meetingDates) => {
     : getWeekLabel(weekOffset);
 };
 
-// Computes the true reporting span for a given meeting week: from the day AFTER the
-// previous meeting's date, through the current meeting's date (inclusive). This widens
-// the span to cover any skipped/postponed weeks in between (14, 21+ days), since
-// contribution data logged during a gap has nowhere else to be reported. Falls back to
-// a single calendar week if there's no previous meeting or no dates have been set yet.
+// Reporting span for a week: ONLY that week's own data. Amounts saved under any other
+// week (including non-meeting weeks in between) are never added in; they appear under
+// their own week and in All Time. The label is the meeting date when one is set.
 const computeMeetingSpan = (currentWeek, meetingWeeks, meetingDates, weekOffset) => {
   const sortedMeetingWeeks = [...meetingWeeks].sort();
   const curIdx = sortedMeetingWeeks.indexOf(currentWeek);
   const prevMeetingWeek = curIdx > 0 ? sortedMeetingWeeks[curIdx - 1] : null;
-
-  let spanWeekKeys;
-  if (!meetingWeeks.includes(currentWeek)) {
-    spanWeekKeys = [currentWeek];
-  } else {
-    const curOffset = weekKeyToOffset(currentWeek);
-    const prevOffset = prevMeetingWeek ? weekKeyToOffset(prevMeetingWeek) : curOffset - 1;
-    spanWeekKeys = [];
-    for (let o = prevOffset + 1; o <= curOffset; o++) spanWeekKeys.push(getWeekKey(o));
-  }
-
-  const spanLabel = prevMeetingWeek && meetingDates[prevMeetingWeek] && meetingDates[currentWeek]
-    ? (() => {
-        const dayAfterPrev = new Date(new Date(meetingDates[prevMeetingWeek] + "T00:00:00").getTime() + 86400000);
-        const curDate = new Date(meetingDates[currentWeek] + "T00:00:00");
-        const fmt = (d) => d.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
-        return `${fmt(dayAfterPrev)} — ${fmt(curDate)}`;
-      })()
+  const spanWeekKeys = [currentWeek];
+  const spanLabel = meetingDates && meetingDates[currentWeek]
+    ? new Date(meetingDates[currentWeek] + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short" })
     : getWeekLabel(weekOffset);
-
   return { prevMeetingWeek, spanWeekKeys, spanLabel };
 };
 
@@ -168,19 +151,40 @@ const inputStyle = {
 };
 
 // ── Atoms ─────────────────────────────────────────────────────────
-const Input = ({ value, onChange, type = "text", placeholder, maxLength }) => (
-  <input value={value} onChange={e => onChange(e.target.value)}
+const Input = ({ value, onChange, type = "text", placeholder, maxLength, onKeyDown }) => (
+  <input value={value} onChange={e => onChange(e.target.value)} onKeyDown={onKeyDown}
     type={type} placeholder={placeholder} maxLength={maxLength} style={inputStyle} />
 );
 
-const Btn = ({ children, onClick, style = {}, disabled }) => (
-  <button onClick={onClick} disabled={disabled} style={{
+const Btn = ({ children, onClick, style = {}, disabled, type = "button" }) => (
+  <button type={type} onClick={onClick} disabled={disabled} style={{
     background: disabled ? "#2A2D3A" : "#6C63FF", color: disabled ? "#8888AA" : "#fff",
     border: "none", borderRadius: 12, padding: "14px 0", width: "100%",
     fontSize: 16, fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer",
     letterSpacing: ".5px", ...style,
   }}>{children}</button>
 );
+
+// Member photo. Order: the pasted Photo URL, then the photo shipped with the app, then a placeholder.
+// Shipped photos are named by SERIAL NUMBER: public/Photos/u<slNo>.jpg (e.g. u12.jpg for #12).
+// A member's internal id can differ from the serial number, so the id is only tried as a fallback.
+const PHOTO_DIR = "/Photos";
+const MemberPhoto = ({ user, size = 84 }) => {
+  const sources = [...new Set([
+    user.photoUrl,
+    user.slNo !== undefined && user.slNo !== null && user.slNo !== "" ? `${PHOTO_DIR}/u${user.slNo}.jpg` : "",
+    user.id ? `${PHOTO_DIR}/${user.id}.jpg` : "",
+  ].filter(Boolean))];
+  const [idx, setIdx] = useState(0);
+  useEffect(() => { setIdx(0); }, [user.id, user.slNo, user.photoUrl]);
+  if (idx >= sources.length) return (
+    <div style={{ width: size, height: size, borderRadius: "50%", background: "#0F1117", border: "2px solid #2A2D3A", display: "flex", alignItems: "center", justifyContent: "center", fontSize: Math.round(size * 0.38), color: "#3A3D4A" }}>👤</div>
+  );
+  return (
+    <img key={sources[idx]} src={sources[idx]} alt={user.name} onError={() => setIdx(i => i + 1)}
+      style={{ width: size, height: size, borderRadius: "50%", objectFit: "cover", objectPosition: "50% 20%", border: "2px solid #2A2D3A" }} />
+  );
+};
 
 const Tag = ({ present }) => (
   <span style={{ background: present ? "#22C55E22" : "#EF444422", color: present ? "#22C55E" : "#EF4444", borderRadius: 20, padding: "3px 11px", fontSize: 12, fontWeight: 700 }}>
@@ -214,12 +218,12 @@ const Toggle = ({ checked, onChange }) => (
 );
 
 // ── Week Nav ──────────────────────────────────────────────────────
-const WeekNav = ({ weekOffset, setWeekOffset, meetingWeeks, meetingDates, disabled }) => {
+const WeekNav = ({ weekOffset, setWeekOffset, meetingWeeks, meetingDates, disabled, locked }) => {
   const currentKey = getWeekKey(weekOffset);
   const sorted     = [...(meetingWeeks || [])].sort();
   const idx        = sorted.indexOf(currentKey);
-  const hasPrev    = !disabled && idx > 0;
-  const hasNext    = !disabled && idx < sorted.length - 1;
+  const hasPrev    = !disabled && !locked && idx > 0;
+  const hasNext    = !disabled && !locked && idx < sorted.length - 1;
   const noMeetings = sorted.length === 0;
 
   const jumpToKey = (key) => setWeekOffset(weekKeyToOffset(key));
@@ -256,7 +260,7 @@ const Nav = ({ screen, session, setScreen, setSession }) => {
     ? [["home","🏠","Home"],["mark","✅","Attendance"],["biz","💰","Business"],["admin","⚙️","Manage"]]
     : session?.role === "head_table"
     ? [["home","🏠","Home"],["mark","✅","Attendance"],["biz","💰","Business"],["profile","👤","Profile"]]
-    : [["home","🏠","Home"],["profile","👤","Profile"],["history","📅","History"]];
+    : [["home","🏠","Home"],["biz","💰","Business"],["profile","👤","Profile"],["history","📅","History"]];
   return (
     <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 420, background: "#1A1D27", borderTop: "1px solid #2A2D3A", display: "flex", zIndex: 99 }}>
       {tabs.map(([s, icon, label]) => (
@@ -398,12 +402,11 @@ const ViewDetailsModal = ({ viewUser, setViewUser, onEdit, departments, sessionR
             <button onClick={() => setViewUser(null)} style={{ background: "#2A2D3A", border: "none", color: "#F0F0F5", borderRadius: 8, padding: "6px 12px", cursor: "pointer", fontWeight: 700 }}>✕ Close</button>
           </div>
         </div>
-        <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
-          {viewUser.photoUrl ? (
-            <img src={viewUser.photoUrl} alt={viewUser.name} style={{ width: 84, height: 84, borderRadius: "50%", objectFit: "cover", border: "2px solid #2A2D3A" }} onError={e => { e.target.style.display = "none"; }} />
-          ) : (
-            <div style={{ width: 84, height: 84, borderRadius: "50%", background: "#0F1117", border: "2px solid #2A2D3A", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, color: "#3A3D4A" }}>👤</div>
-          )}
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}>
+          <MemberPhoto user={viewUser} size={84} />
+        </div>
+        <div style={{ textAlign: "center", fontSize: 13, color: "#8888AA", fontWeight: 600, marginBottom: 16 }}>
+          Roll Number : <span style={{ color: "#F0F0F5", fontWeight: 800 }}>{viewUser.slNo !== undefined && viewUser.slNo !== null && viewUser.slNo !== "" ? viewUser.slNo : "—"}</span>
         </div>
         <Row label="Full Name" value={viewUser.name} />
         <Row label="Role" value={roleLabel(viewUser.role)} />
@@ -513,6 +516,18 @@ export default function App() {
   const [loadError, setLoadError]         = useState(false);
   const [attTab, setAttTab]               = useState("mark");
   const [manageTab, setManageTab]         = useState("users");
+  const [sysLog, setSysLog]               = useState(null);  // activity log entries (Manage > System), null = not loaded yet
+  const [sysLoading, setSysLoading]       = useState(false);
+  const [sysError, setSysError]           = useState("");
+  const [sysTable, setSysTable]           = useState("all");
+  const [sysText, setSysText]             = useState("");
+  const [sysActor, setSysActor]           = useState("all");  // "all" | "none" (not logged in) | member id
+  const [sysFrom, setSysFrom]             = useState("");     // YYYY-MM-DD
+  const [sysTo, setSysTo]                 = useState("");     // YYYY-MM-DD
+  const [sysOrder, setSysOrder]           = useState("desc"); // desc = newest first, asc = oldest first
+  const [sysCapped, setSysCapped]         = useState(false);
+  const prevSessionRef = useRef(null);
+  const [missingTables, setMissingTables] = useState([]); // tables that did not exist on the server at load
   const [userSearch, setUserSearch]       = useState("");
   const [deptSearch, setDeptSearch]       = useState("");
   const [showUnassigned, setShowUnassigned] = useState(false);
@@ -527,11 +542,14 @@ export default function App() {
   const deptFormRef                       = useRef(null);
   const [business, setBusiness]           = useState({});
   const [bizView, setBizView]             = useState("entry"); // entry | matrix
-  const [giverIndex, setGiverIndex]       = useState(0);
+  const [giverIndex, setGiverIndex]       = useState(0); // only used by admin/head_table to page through other members as giver
   const [takerSelect, setTakerSelect]     = useState({}); // key: giverId -> selected taker id
   const [showReceiversOnly, setShowReceiversOnly] = useState(false);
   const [reportScope, setReportScope]     = useState("all"); // all | week
   const [showClearWeekConfirm, setShowClearWeekConfirm] = useState(false);
+  const [bizOpening, setBizOpening]       = useState({ amount: 0, asOf: "" }); // historical lump sum (no split) and its "up to" date
+  const [openingEdit, setOpeningEdit]     = useState(null); // null | { amount: "", asOf: "YYYY-MM-DD", confirm: bool }
+  const [zeroConfirmKey, setZeroConfirmKey] = useState(null); // inputKey awaiting "save 0" confirmation
   const [confirmUserAction, setConfirmUserAction]       = useState(null); // { uid, type: "disable" | "remove" }
   const [bizAmountInput, setBizAmountInput] = useState({}); // key: `${week}_${giverId}_${recipientId}` -> typed value
   const [editUser, setEditUser]           = useState(null);
@@ -558,33 +576,167 @@ export default function App() {
   const [newPhotoUrl, setNewPhotoUrl]     = useState("");
   const [newBizPhotoUrl, setNewBizPhotoUrl] = useState("");
 
+  // ── A save that would have emptied a table was refused: tell the user and reload that table ──
+  useEffect(() => {
+    const setters = { "att:users": v => setUsers((v || []).map(x => ({ active: true, ...x }))), "att:records": v => setRecords(v || {}), "att:business": v => setBusiness(v || {}), "att:departments": v => setDepartments(v || []), "att:meetingweeks": v => setMeetingWeeks(v || []), "att:meetingdates": v => setMeetingDates(v || {}) };
+    const onBlocked = async (ev) => {
+      const key = ev.detail && ev.detail.table;
+      showToast("⚠️ Blocked a save that would have emptied a whole table. Nothing was changed on the server.", "#EF4444");
+      try { const fresh = await load(key); if (setters[key]) setters[key](fresh); } catch (e) { console.error("Reload after blocked save failed:", e); }
+    };
+    window.addEventListener("jen:save-blocked", onBlocked);
+    return () => window.removeEventListener("jen:save-blocked", onBlocked);
+  }, []);
+
+  // ── Activity log: keep track of who is signed in, and record sign-in / sign-out ──
+  useEffect(() => {
+    const prev = prevSessionRef.current;
+    if (prev && !session) logEvent({ type: "logout", actorId: prev.id, actorName: prev.name, actorRole: prev.role });
+    setAuditActor(session);
+    if (!prev && session) logEvent({ type: "login" });
+    prevSessionRef.current = session;
+  }, [session]);
+
+  // ── Escape closes the topmost open popup or pending confirmation (one per key press) ──
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      if (datePickerFor)        { setDatePickerFor(null); setPendingDate(""); }
+      else if (editUser)        setEditUser(null);
+      else if (viewUser)        setViewUser(null);
+      else if (confirmUserAction) setConfirmUserAction(null);
+      else if (zeroConfirmKey)  setZeroConfirmKey(null);
+      else if (openingEdit)     setOpeningEdit(null);
+      else if (showClearWeekConfirm) setShowClearWeekConfirm(false);
+      else return;
+      e.preventDefault();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [datePickerFor, editUser, viewUser, confirmUserAction, zeroConfirmKey, openingEdit, showClearWeekConfirm]);
+
+  // ── Version check: on the login screen, reload once if a newer build has been deployed ──
+  useEffect(() => {
+    if (screen !== "login") return;
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const current = typeof __BUILD_ID__ !== "undefined" ? __BUILD_ID__ : null;
+        if (!current) return;
+        const res = await fetch(`/version.json?t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) return;
+        const { build } = await res.json();
+        if (cancelled || !build || build === current) return;
+        if (sessionStorage.getItem("jen:reloadedFor") === build) return; // already tried once for this build
+        sessionStorage.setItem("jen:reloadedFor", build);
+        window.location.reload();
+      } catch (e) { /* offline or no version file: carry on with the loaded code */ }
+    };
+    check();
+    const onVisible = () => { if (document.visibilityState === "visible") check(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { cancelled = true; document.removeEventListener("visibilitychange", onVisible); };
+  }, [screen]);
+
   useEffect(() => {
     const timeout = setTimeout(() => setLoadError(true), 10000);
     (async () => {
       try {
         let u = await load("att:users");
-        if (!u) { u = []; await save("att:users", u); }
+        const rawUsers = u;
+        // NEVER write during load. A missing or unreadable list is shown as empty (the login
+        // page explains it) but nothing is saved, so a failed read can no longer wipe the table.
+        // The document is created by the first real save (adding a member).
+        if (!Array.isArray(u)) u = [];
         u = u.map(x => ({ active: true, ...x }));
-        let r = await load("att:records");
-        if (!r) { r = {}; await save("att:records", r); }
-        let d = await load("att:departments");
-        if (!d) { d = []; await save("att:departments", d); }
-        let mw = await load("att:meetingweeks");
-        if (!mw) { mw = []; await save("att:meetingweeks", mw); }
-        let md = await load("att:meetingdates");
-        if (!md) { md = {}; await save("att:meetingdates", md); }
-        let bz = await load("att:business");
-        if (!bz) { bz = {}; await save("att:business", bz); }
+        let r = await load("att:records"); const r0 = r;
+        if (!r) r = {}; // no write on load
+        let d = await load("att:departments"); const d0 = d;
+        if (!d) d = []; // no write on load
+        let mw = await load("att:meetingweeks"); const mw0 = mw;
+        if (!mw) mw = []; // no write on load
+        let md = await load("att:meetingdates"); const md0 = md;
+        if (!md) md = {}; // no write on load
+        let bz = await load("att:business"); const bz0 = bz;
+        if (!bz) bz = {}; // no write on load
+        // Historical total is optional: a failed read must not stop the app from loading.
+        // Early warning: record any main table that is missing or empty at load.
+        const rawState = { "att:users": rawUsers, "att:records": r0, "att:departments": d0, "att:meetingweeks": mw0, "att:meetingdates": md0, "att:business": bz0 };
+        const missing = Object.keys(rawState).filter(k => rawState[k] === null || rawState[k] === undefined);
+        const emptyNow = Object.keys(rawState).filter(k => !missing.includes(k) && (Array.isArray(rawState[k]) ? rawState[k].length === 0 : Object.keys(rawState[k] || {}).length === 0));
+        setMissingTables(missing);
+        if (missing.length || emptyNow.length) logEvent({ type: "table_empty", changes: [...missing.map(k => `${k}: missing on the server`), ...emptyNow.map(k => `${k}: empty`)] });
+        let bo = null;
+        try { bo = await load("att:businessopening"); } catch (e) { console.error("Failed to read historical total:", e); }
+        if (bo && typeof bo.amount === "number" && Number.isFinite(bo.amount) && bo.amount > 0) setBizOpening({ amount: Math.round(bo.amount), asOf: bo.asOf || "" });
         setUsers(u); setRecords(r); setDepartments(d); setMeetingWeeks(mw); setMeetingDates(md); setBusiness(bz); setLoading(false);
         clearTimeout(timeout);
-      } catch (e) { setLoadError(true); clearTimeout(timeout); }
+      } catch (e) { setLoadError(true); clearTimeout(timeout); logEvent({ type: "load_failed", error: String((e && e.message) || e) }); }
     })();
     return () => clearTimeout(timeout);
   }, []);
 
   const showToast      = (msg, color = "#22C55E") => { setToast({ msg, color }); setTimeout(() => setToast(null), 2800); };
   const persistRecords     = async (r) => { setRecords(r); await save("att:records", r); };
-  const persistUsers       = async (u) => { setUsers(u);   await save("att:users", u); };
+  // Audit log: records who/what/when for every write attempt to att:users, kept in
+  // a separate document so we can answer "who did it" after the fact. Capped to the
+  // most recent 200 entries so the document doesn't grow unbounded.
+  // Normal saves are logged automatically by save(). This only records a REFUSED user-list save.
+  const logUserListChange = async (event, beforeCount, afterCount) => {
+    if (event !== "blocked") return;
+    await logEvent({ type: "blocked", table: "att:users", changes: [`refused to change the member list from ${beforeCount} to ${afterCount} members`], removals: Math.max(0, beforeCount - afterCount), beforeSize: beforeCount, afterSize: afterCount });
+  };
+
+  // Pass the filter values explicitly when they have just changed (state updates are not instant).
+  const loadSysLog = async (f = {}) => {
+    if (!isSuperAdmin(session)) return showToast("Only the super admin can view the activity log", "#EF4444");
+    const actor = f.actor !== undefined ? f.actor : sysActor;
+    const from  = f.from  !== undefined ? f.from  : sysFrom;
+    const to    = f.to    !== undefined ? f.to    : sysTo;
+    if (from && to && from > to) { setSysError("The 'from' date is after the 'to' date."); return; }
+    setSysLoading(true); setSysError("");
+    try {
+      const res = await loadAuditLog({
+        actorId: actor === "all" ? undefined : actor === "none" ? null : actor,
+        from: from ? new Date(from + "T00:00:00") : undefined,
+        to:   to   ? new Date(to   + "T23:59:59.999") : undefined,
+      });
+      setSysLog(res.rows); setSysCapped(res.capped);
+    }
+    catch (e) { console.error("Failed to load activity log:", e); setSysError("Could not load the activity log. Check the connection, and that the Firestore rules allow reading the auditlog collection."); }
+    setSysLoading(false);
+  };
+
+  // Safety net: this is the SINGLE choke point every user-list write goes through
+  // (initial load, add, edit, disable, remove). Legitimate removals happen one at a
+  // time via deleteMember (with confirmation), so the count should only ever drop
+  // by 1 per call. A jump straight from many users to zero in one write is almost
+  // never a deliberate, correct action — it's the signature of stale/corrupted local
+  // state (e.g. an old browser tab still running pre-fix code, or a failed read
+  // upstream) silently wiping the table. Block it outright rather than trust the caller.
+  const persistUsers = async (u) => {
+    // Every legitimate call site changes the list by at most 1 person (deleteMember
+    // removes exactly one; toggleActive/saveEdit use .map() and never change length
+    // at all). A drop of more than 1 in a single write is never a normal, deliberate
+    // action — block it outright rather than trust the caller, whatever the cause.
+    const drop = users.length - (Array.isArray(u) ? u.length : 0);
+    // An empty (or non-list) user table is never a valid thing to save.
+    if (!Array.isArray(u) || u.length === 0) {
+      console.error("persistUsers BLOCKED: refused to save an empty user list.");
+      showToast("⚠️ Blocked a save that would have emptied the member list. Please refresh the page — contact the super admin if this keeps happening.", "#EF4444");
+      await logUserListChange("blocked", users.length, Array.isArray(u) ? u.length : -1);
+      return;
+    }
+    if (Array.isArray(u) && drop > 1) {
+      console.error(`persistUsers BLOCKED: refused to drop from ${users.length} to ${u.length} users in one write.`);
+      showToast("⚠️ Blocked a save that would have removed multiple members at once. Please refresh the page and try again — contact the super admin if this keeps happening.", "#EF4444");
+      await logUserListChange("blocked", users.length, u.length);
+      return;
+    }
+    await logUserListChange("write", users.length, Array.isArray(u) ? u.length : -1);
+    setUsers(u);
+    await save("att:users", u);
+  };
   const persistDepartments  = async (d)  => { setDepartments(d);   await save("att:departments",  d); };
   const persistMeetingWeeks = async (mw) => { setMeetingWeeks(mw); await save("att:meetingweeks", mw); };
   const persistMeetingDates = async (md) => { setMeetingDates(md); await save("att:meetingdates", md); };
@@ -598,8 +750,9 @@ export default function App() {
 
   const saveRecipientAmount = async (week, giverId, recipientId, rawValue) => {
     const amt = parseInt(rawValue, 10);
-    if (!rawValue || isNaN(amt) || amt <= 0) return showToast("Enter a valid amount", "#F59E0B");
+    if (rawValue === "" || rawValue == null || isNaN(amt) || amt < 0) return showToast("Enter a valid amount", "#F59E0B");
     const map = getRecipientMap(week, giverId);
+    if (amt === 0 && !(map[recipientId] > 0)) return showToast("No saved amount to remove", "#F59E0B");
     map[recipientId] = amt;
     const updated = { ...business, [week]: { ...(business[week] || {}) } };
     updated[week][giverId] = map;
@@ -608,10 +761,25 @@ export default function App() {
     setBizAmountInput(f => ({ ...f, [inputKey]: "" }));
     const giverName = users.find(u => u.id === giverId)?.name;
     const receiverName = users.find(u => u.id === recipientId)?.name;
-    showToast(`${giverName} → ${receiverName}: ₹${amt.toLocaleString("en-IN")}`, "#22C55E");
+    showToast(amt === 0 ? `${giverName} → ${receiverName}: entry removed` : `${giverName} → ${receiverName}: ₹${amt.toLocaleString("en-IN")}`, amt === 0 ? "#F59E0B" : "#22C55E");
   };
 
-  const goToGiver = (newIdx) => setGiverIndex(newIdx);
+  const saveBusinessOpening = async (rawAmount, asOf) => {
+    if (!isSuperAdmin(session)) return showToast("Only the super admin can set the historical total", "#EF4444");
+    const amt = parseInt(rawAmount, 10);
+    if (rawAmount === "" || rawAmount == null || isNaN(amt) || amt < 0) return showToast("Enter a valid amount", "#F59E0B");
+    if (amt > 0 && !/^\d{4}-\d{2}-\d{2}$/.test(asOf || "")) return showToast("Choose the 'up to' date", "#F59E0B");
+    const next = { amount: amt, asOf: amt > 0 ? asOf : "" };
+    try {
+      await save("att:businessopening", next);
+    } catch (e) {
+      console.error("Failed to save historical total:", e);
+      return showToast("Could not save the historical total", "#EF4444");
+    }
+    setBizOpening(next);
+    setOpeningEdit(null);
+    showToast(amt > 0 ? `Historical total set: ₹${amt.toLocaleString("en-IN")}` : "Historical total removed", amt > 0 ? "#22C55E" : "#F59E0B");
+  };
 
   const clearWeekBusiness = async (week) => {
     if (!isSuperAdmin(session)) return showToast("Only the super admin can clear contribution data", "#EF4444");
@@ -710,13 +878,13 @@ export default function App() {
     let u;
     if (typeUsername) {
       u = users.find(x => x.name.toLowerCase() === usernameInput.trim().toLowerCase());
-      if (!u) return showToast("User not found", "#F59E0B");
+      if (!u) { logEvent({ type: "login_failed", changes: [`unknown name: ${usernameInput.trim().slice(0, 40)}`] }); return showToast("User not found", "#F59E0B"); }
     } else {
       u = users.find(x => x.id === selUser);
       if (!u) return showToast("Select a member first", "#F59E0B");
     }
-    if (u.active === false) return showToast("Account disabled. Contact admin.", "#EF4444");
-    if (u.pin !== pinInput) return showToast("Wrong PIN", "#EF4444");
+    if (u.active === false) { logEvent({ type: "login_failed", actorId: u.id, actorName: u.name, changes: ["account disabled"] }); return showToast("Account disabled. Contact admin.", "#EF4444"); }
+    if (u.pin !== pinInput) { logEvent({ type: "login_failed", actorId: u.id, actorName: u.name, changes: ["wrong PIN"] }); return showToast("Wrong PIN", "#EF4444"); }
     if (meetingWeeks.length > 0) {
       const latestWeek = [...meetingWeeks].sort().slice(-1)[0];
       setWeekOffset(weekKeyToOffset(latestWeek));
@@ -744,7 +912,8 @@ export default function App() {
       const created = await addUserAtomic(fields);
       // Refresh local state from the source of truth after the atomic write
       const latest = await load("att:users");
-      setUsers(latest || []);
+      // Only trust a real list from the server; otherwise keep what we have and add the new member locally.
+      setUsers(prev => (Array.isArray(latest) && latest.length > 0) ? latest : [...(prev || []), created]);
       resetForm();
       showToast(`${created.name} added! (#${created.slNo})`);
     } catch (e) {
@@ -789,8 +958,8 @@ export default function App() {
       {loadError ? (
         <>
           <div style={{ fontSize: 40 }}>⚠️</div>
-          <div style={{ color: "#F0F0F5", fontWeight: 700, fontSize: 18 }}>Connection Failed</div>
-          <div style={{ color: "#8888AA", fontSize: 13, textAlign: "center" }}>Unable to reach Firebase. Check your internet or Firebase rules.</div>
+          <div style={{ color: "#F0F0F5", fontWeight: 700, fontSize: 18 }}>Unable to load JEN Track</div>
+          <div style={{ color: "#8888AA", fontSize: 13, textAlign: "center", lineHeight: 1.6 }}>The member list could not be loaded from the server.<br />Please check your internet connection and tap Retry.<br />If the problem continues, contact the admin.</div>
           <button onClick={() => window.location.reload()} style={{ background: "#6C63FF", color: "#fff", border: "none", borderRadius: 12, padding: "12px 28px", fontSize: 15, fontWeight: 700, cursor: "pointer", marginTop: 8 }}>🔄 Retry</button>
         </>
       ) : (
@@ -803,11 +972,24 @@ export default function App() {
     </div>
   );
 
+  // Table health: how many items each table holds right now (as loaded by this device).
+  const tableHealth = [
+    ["att:users", "Users", users.length, "member", "members"],
+    ["att:records", "Attendance", Object.keys(records).length, "week", "weeks"],
+    ["att:business", "Contributions", Object.keys(business).length, "week", "weeks"],
+    ["att:meetingweeks", "Meeting weeks", meetingWeeks.length, "week", "weeks"],
+    ["att:meetingdates", "Meeting dates", Object.keys(meetingDates).length, "date", "dates"],
+    ["att:departments", "Categories", departments.length, "category", "categories"],
+  ].map(([key, label, count, one, many]) => ({ key, label, count, unit: count === 1 ? one : many, missing: missingTables.includes(key) }));
+  const emptyTables = tableHealth.filter(t => t.count === 0);
   const currentWeek   = getWeekKey(weekOffset);
   const weekRec       = records[currentWeek] || {};
   const weekBiz       = business[currentWeek] || {};
   const weekBizTotal  = Object.keys(weekBiz).reduce((s, gid) => s + getGiverEntries(business, currentWeek, gid).reduce((a, e) => a + (e.amount || 0), 0), 0);
-  const grandBizTotal = Object.keys(business).reduce((s, wk) => s + Object.keys(business[wk] || {}).reduce((a, gid) => a + getGiverEntries(business, wk, gid).reduce((b, e) => b + (e.amount || 0), 0), 0), 0);
+  const openingAmount = bizOpening.amount || 0;
+  const openingLabel  = bizOpening.asOf ? `up to ${new Date(bizOpening.asOf + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}` : "historical";
+  // Recorded total counts meeting weeks only; amounts saved under a non-meeting week are left out.
+  const grandBizTotal = Object.keys(business).filter(wk => meetingWeeks.includes(wk)).reduce((s, wk) => s + Object.keys(business[wk] || {}).reduce((a, gid) => a + getGiverEntries(business, wk, gid).reduce((b, e) => b + (e.amount || 0), 0), 0), 0);
   const activeMembers = users.filter(u => u.id !== "u1" && u.active !== false);
   const latestMeetingWeek = meetingWeeks.length ? [...meetingWeeks].sort().slice(-1)[0] : null;
   // A meeting week is "frozen" for attendance marking once a later meeting week exists —
@@ -844,6 +1026,7 @@ export default function App() {
         <div style={{ color: "#8888AA", fontSize: 14, marginTop: 4 }}>Joint Entrepreneurs Network</div>
       </div>
       <Card>
+        <form onSubmit={e => { e.preventDefault(); handleLogin(); }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
           <Label>{typeUsername ? "Type Username" : "Select Member"}</Label>
           <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12, color: "#8888AA" }}>
@@ -851,10 +1034,21 @@ export default function App() {
             Type name
           </label>
         </div>
+        {users.filter(u => u.id !== "u1" && u.active !== false).length === 0 && (
+          <div role="alert" style={{ background: "#F59E0B22", border: "1px solid #F59E0B66", borderRadius: 10, padding: 12, marginBottom: 14 }}>
+            <div style={{ color: "#F59E0B", fontWeight: 700, fontSize: 13, marginBottom: 4 }}>⚠️ Member list unavailable</div>
+            <div style={{ color: "#F0F0F5", fontSize: 12, lineHeight: 1.6, marginBottom: 10 }}>
+              {users.length === 0
+                ? "No members could be loaded, so sign-in is not possible right now. Please check your internet connection and tap Retry. If the problem continues, contact the admin."
+                : "There are no active members to choose from. Please contact the admin."}
+            </div>
+            <button type="button" onClick={() => window.location.reload()} style={{ background: "#F59E0B", color: "#0F1117", border: "none", borderRadius: 8, padding: "7px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>🔄 Retry</button>
+          </div>
+        )}
         {typeUsername ? (
           <input value={usernameInput} onChange={e => setUsernameInput(e.target.value)} placeholder="Type your full name" style={{ ...inputStyle, marginBottom: 16 }} />
         ) : (
-          <select value={selUser} onChange={e => setSelUser(e.target.value)} style={{ ...inputStyle, marginBottom: 16, color: selUser ? "#F0F0F5" : "#8888AA" }}>
+          <select value={selUser} onChange={e => setSelUser(e.target.value)} onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); handleLogin(); } }} style={{ ...inputStyle, marginBottom: 16, color: selUser ? "#F0F0F5" : "#8888AA" }}>
             <option value="">— Choose your name —</option>
             {users.filter(u => u.id !== "u1" && u.active !== false).map(u => (
               <option key={u.id} value={u.id}>{u.name}{u.role !== "member" ? ` ${roleLabel(u.role)}` : ""}</option>
@@ -864,7 +1058,8 @@ export default function App() {
         <Label>PIN</Label>
         <Input value={pinInput} onChange={setPinInput} type="password" placeholder="Enter PIN" maxLength={8} />
         <div style={{ height: 16 }} />
-        <Btn onClick={handleLogin}>Sign In</Btn>
+        <Btn type="submit">Sign In</Btn>
+        </form>
       </Card>
     </div>
   );
@@ -875,6 +1070,12 @@ export default function App() {
       {toast && <Toast t={toast} />}
       <EditModal editUser={editUser} editFields={editFields} setEditFields={setEditFields} setEditUser={setEditUser} saveEdit={saveEdit} sessionRole={session.role} sessionId={session.id} sessionIsSuperAdmin={isSuperAdmin(session)} departments={departments} />
       <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} meetingDates={meetingDates} />
+      {(isPrivileged(session.role) || isSuperAdmin(session)) && emptyTables.length > 0 && (
+        <div role="alert" style={{ margin: "12px 20px 0", background: "#EF444422", border: "1px solid #EF444466", borderRadius: 10, padding: 12 }}>
+          <div style={{ color: "#EF4444", fontWeight: 700, fontSize: 13, marginBottom: 4 }}>⚠️ Data check: empty table{emptyTables.length > 1 ? "s" : ""}</div>
+          <div style={{ color: "#F0F0F5", fontSize: 12, lineHeight: 1.6 }}>{emptyTables.map(t => t.label + (t.missing ? " (missing)" : "")).join(", ")} {emptyTables.length > 1 ? "have" : "has"} no data. If that is not expected, do not enter anything and inform the super admin.</div>
+        </div>
+      )}
       <div style={{ padding: "20px 20px 12px" }}>
         <div style={{ color: "#8888AA", fontSize: 13 }}>Welcome back,</div>
         <H1>{session.name} {session.role === "admin" ? "👑" : session.role === "head_table" ? "🎖️" : ""}</H1>
@@ -1218,37 +1419,30 @@ export default function App() {
 
   // ── BUSINESS ──
   if (screen === "biz") {
-    if (!isPrivileged(session.role)) return (
-      <div style={S}>
-        {toast && <Toast t={toast} />}
-        <div style={{ padding: "28px 20px" }}>
-          <H1>Business</H1>
-          <div style={{ background: "#EF444422", border: "1px solid #EF444444", borderRadius: 14, padding: 20, marginTop: 20, textAlign: "center" }}>
-            <div style={{ fontSize: 36, marginBottom: 10 }}>🚫</div>
-            <div style={{ fontWeight: 700, fontSize: 16, color: "#EF4444", marginBottom: 8 }}>Access Restricted</div>
-            <div style={{ color: "#8888AA", fontSize: 13 }}>Only admins and head table can log business.</div>
-          </div>
-        </div>
-        <Nav screen={screen} session={session} setScreen={setScreen} setSession={setSession} />
-      </div>
-    );
+    // Report is admin/head_table only; regular members retain full access to Contribution.
+    // Guard against stale state: if a member's bizView was somehow left on "matrix"
+    // (e.g. before this restriction existed), force it back to "entry".
+    const effectiveBizView = (bizView === "matrix" && !isPrivileged(session.role)) ? "entry" : bizView;
     return (
       <div style={S}>
         {toast && <Toast t={toast} />}
-        <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} meetingDates={meetingDates} disabled={bizView === "matrix" && reportScope === "all"} />
+        <WeekNav weekOffset={weekOffset} setWeekOffset={setWeekOffset} meetingWeeks={meetingWeeks} meetingDates={meetingDates} disabled={effectiveBizView === "matrix" && reportScope === "all"} locked={!isPrivileged(session.role)} />
         <div style={{ padding: "16px 20px 8px" }}><H1>💰 Business</H1></div>
         <div style={{ padding: "0 20px" }}>
-          <div style={{ display: "flex", gap: 8, marginTop: 14, marginBottom: 14 }}>
-            {[["entry","✏️ Contribution"],["matrix","📊 Report"]].map(([t, label]) => (
-              <button key={t} onClick={() => setBizView(t)} style={{ background: bizView === t ? "#6C63FF" : "#2A2D3A", color: bizView === t ? "#fff" : "#8888AA", border: "none", borderRadius: 20, padding: "7px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
-            ))}
-          </div>
+          {isPrivileged(session.role) && (
+            <div style={{ display: "flex", gap: 8, marginTop: 14, marginBottom: 14 }}>
+              {[["entry","✏️ Contribution"],["matrix","📊 Report"]].map(([t, label]) => (
+                <button key={t} onClick={() => setBizView(t)} style={{ background: effectiveBizView === t ? "#6C63FF" : "#2A2D3A", color: effectiveBizView === t ? "#fff" : "#8888AA", border: "none", borderRadius: 20, padding: "7px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{label}</button>
+              ))}
+            </div>
+          )}
 
-          {bizView === "entry" && (() => {
+          {effectiveBizView === "entry" && (() => {
+            const canPickGiver = isPrivileged(session.role);
             const sortedMembers = [...activeMembers].sort((a, b) => (a.slNo || 0) - (b.slNo || 0));
-            const idx = Math.min(giverIndex, sortedMembers.length - 1);
-            const giver = sortedMembers[idx];
-            if (!giver) return <Card><div style={{ color: "#8888AA", fontSize: 14 }}>No members available.</div></Card>;
+            const selfAsGiver = activeMembers.find(m => m.id === session.id) || session;
+            const giverIdx = canPickGiver ? Math.min(giverIndex, sortedMembers.length - 1) : -1;
+            const giver = canPickGiver ? (sortedMembers[giverIdx] || selfAsGiver) : selfAsGiver;
             const takers = activeMembers.filter(x => x.id !== giver.id).sort((a, b) => (a.slNo || 0) - (b.slNo || 0));
             const recipientMap = getRecipientMap(currentWeek, giver.id);
             const selectedTakerId = takerSelect[giver.id] || "";
@@ -1286,21 +1480,76 @@ export default function App() {
                       );
                     })()}
                   </div>
-                  <div style={{ fontSize: 11, color: "#8888AA", marginTop: 8 }}>Grand total (all meetings): <b style={{ color: "#F0F0F5" }}>₹{grandBizTotal.toLocaleString("en-IN")}</b></div>
+                  {openingAmount > 0 ? (
+                    <div style={{ fontSize: 11, color: "#8888AA", marginTop: 8, lineHeight: 1.7 }}>
+                      {(isPrivileged(session.role) || isSuperAdmin(session)) && (
+                        <>
+                          <div>Historical ({openingLabel}): <b style={{ color: "#F0F0F5" }}>₹{openingAmount.toLocaleString("en-IN")}</b></div>
+                          <div>Recorded (all meetings): <b style={{ color: "#F0F0F5" }}>₹{grandBizTotal.toLocaleString("en-IN")}</b></div>
+                        </>
+                      )}
+                      <div style={{ fontSize: 13 }}>Grand total: <b style={{ color: "#22C55E" }}>₹{(openingAmount + grandBizTotal).toLocaleString("en-IN")}</b></div>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: "#8888AA", marginTop: 8 }}>Grand total (all meetings): <b style={{ color: "#F0F0F5" }}>₹{grandBizTotal.toLocaleString("en-IN")}</b></div>
+                  )}
+                  {isSuperAdmin(session) && !openingEdit && (
+                    <button onClick={() => setOpeningEdit({ amount: openingAmount > 0 ? String(openingAmount) : "", asOf: bizOpening.asOf || "2026-07-31", confirm: false })}
+                      style={{ marginTop: 10, background: "#6C63FF22", border: "none", color: "#6C63FF", borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                      ✏️ {openingAmount > 0 ? "Edit historical total" : "Add historical total"}
+                    </button>
+                  )}
+                  {isSuperAdmin(session) && openingEdit && (
+                    <div style={{ marginTop: 10, padding: 10, borderRadius: 10, background: "#2A2D3A55" }}>
+                      <div style={{ fontSize: 11, color: "#8888AA", fontWeight: 600, marginBottom: 6 }}>HISTORICAL TOTAL (LUMP SUM, NO SPLIT)</div>
+                      <input type="text" inputMode="numeric" value={openingEdit.amount} placeholder="₹ Amount"
+                        onChange={e => setOpeningEdit(f => ({ ...f, amount: e.target.value.replace(/[^0-9]/g, ""), confirm: false }))}
+                        style={{ ...inputStyle, fontSize: 13, padding: "10px 10px", marginBottom: 4 }} />
+                      <div style={{ fontSize: 11, color: "#8888AA", marginBottom: 8 }}>{openingEdit.amount ? `₹${parseInt(openingEdit.amount, 10).toLocaleString("en-IN")}` : "Enter 0 to remove"}</div>
+                      <div style={{ fontSize: 11, color: "#8888AA", marginBottom: 4 }}>Accumulated up to</div>
+                      <input type="date" value={openingEdit.asOf}
+                        onChange={e => setOpeningEdit(f => ({ ...f, asOf: e.target.value, confirm: false }))}
+                        style={{ ...inputStyle, fontSize: 13, padding: "10px 10px", marginBottom: 10 }} />
+                      {!openingEdit.confirm ? (
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button onClick={() => { if (openingEdit.amount === "") return showToast("Enter a valid amount", "#F59E0B"); setOpeningEdit(f => ({ ...f, confirm: true })); }} style={{ background: "#6C63FF", border: "none", color: "#fff", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>💾 Save</button>
+                          <button onClick={() => setOpeningEdit(null)} style={{ background: "#2A2D3A", border: "none", color: "#8888AA", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
+                        </div>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: 12, color: "#EF4444", fontWeight: 700, marginBottom: 8 }}>
+                            {parseInt(openingEdit.amount, 10) > 0 ? `Set the historical total to ₹${parseInt(openingEdit.amount, 10).toLocaleString("en-IN")}?` : "Remove the historical total?"}
+                          </div>
+                          <div style={{ display: "flex", gap: 6 }}>
+                            <button onClick={() => saveBusinessOpening(openingEdit.amount, openingEdit.asOf)} style={{ background: "#EF4444", border: "none", color: "#fff", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Confirm</button>
+                            <button onClick={() => setOpeningEdit(f => ({ ...f, confirm: false }))} style={{ background: "#2A2D3A", border: "none", color: "#8888AA", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </Card>
 
                 <Card style={{ padding: 14, marginBottom: 14 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <button onClick={() => goToGiver(Math.max(0, idx - 1))} disabled={idx === 0}
-                      style={{ background: idx === 0 ? "#1A1D27" : "#2A2D3A", border: "none", color: idx === 0 ? "#3A3D4A" : "#F0F0F5", borderRadius: 8, padding: "6px 12px", fontSize: 15, cursor: idx === 0 ? "not-allowed" : "pointer", fontWeight: 700 }}>‹‹</button>
-                    <div style={{ textAlign: "center", flex: 1 }}>
-                      <div style={{ fontSize: 11, color: "#8888AA", fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px" }}>Giver &nbsp;·&nbsp; {idx + 1} of {sortedMembers.length}</div>
+                  {canPickGiver ? (
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <button onClick={() => setGiverIndex(i => Math.max(0, i - 1))} disabled={giverIdx === 0}
+                        style={{ background: giverIdx === 0 ? "#1A1D27" : "#2A2D3A", border: "none", color: giverIdx === 0 ? "#3A3D4A" : "#F0F0F5", borderRadius: 8, padding: "6px 12px", fontSize: 15, cursor: giverIdx === 0 ? "not-allowed" : "pointer", fontWeight: 700 }}>‹‹</button>
+                      <div style={{ textAlign: "center", flex: 1 }}>
+                        <div style={{ fontSize: 11, color: "#8888AA", fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px" }}>Giver &nbsp;·&nbsp; {giverIdx + 1} of {sortedMembers.length}</div>
+                        <div style={{ fontSize: 18, fontWeight: 800 }}>{giver.name}{giver.id === session.id ? " (You)" : ""}</div>
+                        <div style={{ fontSize: 11, color: roleColor(giver.role), fontWeight: 600 }}>{roleLabel(giver.role)}</div>
+                      </div>
+                      <button onClick={() => setGiverIndex(i => Math.min(sortedMembers.length - 1, i + 1))} disabled={giverIdx === sortedMembers.length - 1}
+                        style={{ background: giverIdx === sortedMembers.length - 1 ? "#1A1D27" : "#2A2D3A", border: "none", color: giverIdx === sortedMembers.length - 1 ? "#3A3D4A" : "#F0F0F5", borderRadius: 8, padding: "6px 12px", fontSize: 15, cursor: giverIdx === sortedMembers.length - 1 ? "not-allowed" : "pointer", fontWeight: 700 }}>››</button>
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 11, color: "#8888AA", fontWeight: 600, textTransform: "uppercase", letterSpacing: ".5px" }}>Giver</div>
                       <div style={{ fontSize: 18, fontWeight: 800 }}>{giver.name}</div>
                       <div style={{ fontSize: 11, color: roleColor(giver.role), fontWeight: 600 }}>{roleLabel(giver.role)}</div>
                     </div>
-                    <button onClick={() => goToGiver(Math.min(sortedMembers.length - 1, idx + 1))} disabled={idx === sortedMembers.length - 1}
-                      style={{ background: idx === sortedMembers.length - 1 ? "#1A1D27" : "#2A2D3A", border: "none", color: idx === sortedMembers.length - 1 ? "#3A3D4A" : "#F0F0F5", borderRadius: 8, padding: "6px 12px", fontSize: 15, cursor: idx === sortedMembers.length - 1 ? "not-allowed" : "pointer", fontWeight: 700 }}>››</button>
-                  </div>
+                  )}
                 </Card>
 
                 <Card style={{ padding: 14, marginBottom: 14 }}>
@@ -1338,12 +1587,26 @@ export default function App() {
                       )}
                       <div style={{ display: "flex", gap: 8 }}>
                         <input type="text" inputMode="decimal" value={typedVal}
-                          onChange={e => setBizAmountInput(f => ({ ...f, [inputKey]: e.target.value.replace(/[^0-9]/g, "") }))}
+                          onChange={e => { setZeroConfirmKey(null); setBizAmountInput(f => ({ ...f, [inputKey]: e.target.value.replace(/[^0-9]/g, "") })); }}
                           placeholder={savedAmt > 0 ? `Update amount (₹${savedAmt.toLocaleString("en-IN")})` : "₹ Amount"}
                           style={{ ...inputStyle, flex: 1, fontSize: 13, padding: "10px 10px" }} />
-                        <button onClick={() => saveRecipientAmount(currentWeek, giver.id, selectedTakerId, typedVal)}
+                        <button onClick={() => {
+                            if (typedVal !== "" && parseInt(typedVal, 10) === 0 && savedAmt > 0) return setZeroConfirmKey(inputKey);
+                            saveRecipientAmount(currentWeek, giver.id, selectedTakerId, typedVal);
+                          }}
                           style={{ background: "#6C63FF", border: "none", color: "#fff", borderRadius: 10, padding: "0 16px", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>💾 Save</button>
                       </div>
+                      {zeroConfirmKey === inputKey && (
+                        <div style={{ marginTop: 10, padding: 10, borderRadius: 10, background: "#EF444422" }}>
+                          <div style={{ fontSize: 12, color: "#EF4444", fontWeight: 700, marginBottom: 8 }}>
+                            Confirm ₹0? This removes the saved ₹{savedAmt.toLocaleString("en-IN")} entry from the list.
+                          </div>
+                          <div style={{ display: "flex", gap: 6 }}>
+                            <button onClick={() => { saveRecipientAmount(currentWeek, giver.id, selectedTakerId, "0"); setZeroConfirmKey(null); }} style={{ background: "#EF4444", border: "none", color: "#fff", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Confirm</button>
+                            <button onClick={() => setZeroConfirmKey(null)} style={{ background: "#2A2D3A", border: "none", color: "#8888AA", borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Cancel</button>
+                          </div>
+                        </div>
+                      )}
                     </>
                   )}
                 </Card>
@@ -1363,13 +1626,13 @@ export default function App() {
             );
           })()}
 
-          {bizView === "matrix" && (() => {
+          {effectiveBizView === "matrix" && (() => {
             const sortedMembers = [...activeMembers].sort((a, b) => (a.slNo || 0) - (b.slNo || 0));
             const { prevMeetingWeek, spanWeekKeys, spanLabel } = computeMeetingSpan(currentWeek, meetingWeeks, meetingDates, weekOffset);
 
             const getTotalGivenTo = (giverId, recipientId) => {
               let total = 0;
-              const weeksToScan = reportScope === "week" ? spanWeekKeys : Object.keys(business);
+              const weeksToScan = reportScope === "week" ? spanWeekKeys : Object.keys(business).filter(wk => meetingWeeks.includes(wk)); // All Time = meeting weeks only
               weeksToScan.forEach(w => {
                 getGiverEntries(business, w, giverId).forEach(e => { if (e.to === recipientId) total += (e.amount || 0); });
               });
@@ -1512,7 +1775,10 @@ export default function App() {
               <>
                 <Card style={{ marginBottom: 14, textAlign: "center" }}>
                   <div style={{ fontSize: 13, color: "#8888AA", fontWeight: 600 }}>CONTRIBUTION GRAND TOTAL</div>
-                  <div style={{ fontSize: 30, fontWeight: 800, color: "#22C55E" }}>₹{grand.toLocaleString("en-IN")}</div>
+                  <div style={{ fontSize: 30, fontWeight: 800, color: "#22C55E" }}>₹{(reportScope === "all" ? grand + openingAmount : grand).toLocaleString("en-IN")}</div>
+                  {reportScope === "all" && openingAmount > 0 && (
+                    <div style={{ fontSize: 11, color: "#8888AA", marginTop: 6 }}>₹{openingAmount.toLocaleString("en-IN")} historical ({openingLabel}) + ₹{grand.toLocaleString("en-IN")} recorded</div>
+                  )}
                   <div style={{ fontSize: 11, color: "#8888AA", marginTop: 6 }}>
                     {reportScope === "week"
                       ? (meetingDates[currentWeek]
@@ -1598,6 +1864,9 @@ export default function App() {
       </div>
       <div style={{ padding: "0 20px" }}>
         <Card>
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 14 }}>
+            <MemberPhoto user={session} size={96} />
+          </div>
           {[["Name",session.name],["Role",roleLabel(session.role)],["Phone",session.phone||"—"],["Email",session.email||"—"],["Category",session.department||"—"],["Address",session.address||"—"],["Pincode",session.pincode||"—"],["Business",session.business||"—"]].map(([k,v]) => (
             <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid #2A2D3A" }}>
               <span style={{ color: "#8888AA", fontSize: 13 }}>{k}</span>
@@ -1674,8 +1943,8 @@ export default function App() {
 
       {/* Sub-tabs */}
       <div style={{ display: "flex", gap: 8, padding: "0 20px 12px", overflowX: "auto" }}>
-        {[["users","👥 Users"],["meetings","📅 Meeting Weeks"],["departments","🏢 Categories"]].map(([t, label]) => (
-          <button key={t} onClick={() => setManageTab(t)} style={{ background: manageTab === t ? "#6C63FF" : "#2A2D3A", color: manageTab === t ? "#fff" : "#8888AA", border: "none", borderRadius: 20, padding: "8px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>{label}</button>
+        {[["users","👥 Users"],["meetings","📅 Meeting Weeks"],["departments","🏢 Categories"], ...(isSuperAdmin(session) ? [["system","🛠 System"]] : [])].map(([t, label]) => (
+          <button key={t} onClick={() => { setManageTab(t); if (t === "system" && sysLog === null) loadSysLog(); }} style={{ background: manageTab === t ? "#6C63FF" : "#2A2D3A", color: manageTab === t ? "#fff" : "#8888AA", border: "none", borderRadius: 20, padding: "8px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>{label}</button>
         ))}
       </div>
 
@@ -1765,6 +2034,19 @@ export default function App() {
                 </div>
               )}
             </Card>
+            {users.filter(u => u.id !== "u1").length === 0 && (
+              <Card style={{ background: "#EF444422", border: "2px solid #EF4444" }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                  <span style={{ fontSize: 28 }}>🚨</span>
+                  <div>
+                    <div style={{ fontSize: 15, color: "#EF4444", fontWeight: 800, marginBottom: 4 }}>No members found!</div>
+                    <div style={{ fontSize: 12, color: "#F0F0F5" }}>
+                      Your team member list appears to be empty. If this is unexpected (you had members before), <b>do not add new members yet</b> — restore from your backup collection first to avoid losing historical attendance/contribution links. Contact your super admin immediately.
+                    </div>
+                  </div>
+                </div>
+              </Card>
+            )}
             <Card>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
                 <div style={{ fontSize: 14, color: "#8888AA", fontWeight: 600 }}>
@@ -1982,6 +2264,146 @@ export default function App() {
             </Card>
           </>
         )}
+
+        {manageTab === "system" && isSuperAdmin(session) && (() => {
+          // Members who appear in the loaded log but are no longer in the user list.
+          const formerActors = [...new Map((sysLog || []).filter(e => e.actorId && !users.some(u => u.id === e.actorId)).map(e => [e.actorId, { id: e.actorId, name: e.actorName || e.actorId }])).values()];
+          const TABLES = { "att:users": "Users", "att:records": "Attendance", "att:business": "Contributions", "att:departments": "Categories", "att:meetingweeks": "Meeting weeks", "att:meetingdates": "Meeting dates", "att:businessopening": "Historical total" };
+          const TYPES  = { save: ["Saved", "#22C55E"], save_failed: ["Save failed", "#EF4444"], blocked: ["Blocked", "#EF4444"], login: ["Signed in", "#6C63FF"], login_failed: ["Sign-in failed", "#F59E0B"], logout: ["Signed out", "#8888AA"], load_failed: ["Load failed", "#EF4444"], table_empty: ["Empty table found at start-up", "#EF4444"] };
+          const SIGNIN = ["login", "login_failed", "logout"];
+          // Show member names in place of internal ids inside a change line.
+          const nameFor = (id) => {
+            const u = users.find(x => x.id === id);
+            if (u) return `#${u.slNo !== undefined ? u.slNo : "—"} ${u.name}`;
+            if (/^\d{4}-W\d{2}$/.test(id) && meetingDates[id]) return `${new Date(meetingDates[id] + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })} (${id})`;
+            return id;
+          };
+          const pretty = (line) => String(line).split(" › ").map(seg => {
+            const i = seg.indexOf(": ");
+            return i === -1 ? nameFor(seg) : nameFor(seg.slice(0, i)) + seg.slice(i);
+          }).join(" › ");
+          const when = (iso) => { const d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }); };
+          const q = sysText.trim().toLowerCase();
+          const rows = (sysLog || []).filter(e =>
+            (sysTable === "all" || e.table === sysTable || (sysTable === "signin" && SIGNIN.includes(e.type)) || (sysTable === "problems" && (["save_failed", "blocked", "load_failed", "login_failed", "table_empty"].includes(e.type) || e.bigDrop)) || (sysTable === "deletes" && e.removals > 0)) &&
+            (!q || `${e.actorName || ""} ${e.actorId || ""} ${(e.changes || []).map(pretty).join(" ")}`.toLowerCase().includes(q))
+          );
+          const ordered = sysOrder === "asc" ? [...rows].reverse() : rows;
+          const dayOf = (iso) => { const d = new Date(iso); return isNaN(d) ? "Unknown date" : `${d.toLocaleDateString("en-IN", { weekday: "short" })}, ${d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}`; };
+          const dayCounts = {}; ordered.forEach(e => { const k = dayOf(e.ts); dayCounts[k] = (dayCounts[k] || 0) + 1; });
+          const actorLabel = sysActor === "all" ? "" : sysActor === "none" ? "Not logged in" : nameFor(sysActor);
+          const lastChange = (key) => { const e = (sysLog || []).find(x => x.table === key && x.type === "save"); return e ? `${when(e.ts)} by ${e.actorName || "unknown"}` : null; };
+          return (
+            <>
+              <Card style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 13, color: "#8888AA", fontWeight: 600, marginBottom: 8 }}>TABLE HEALTH</div>
+                {tableHealth.map(t => (
+                  <div key={t.key} style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "7px 0", borderBottom: "1px solid #2A2D3A" }}>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</div>
+                      <div style={{ fontSize: 11, color: "#8888AA" }}>{lastChange(t.key) ? `Latest change in the log shown below: ${lastChange(t.key)}` : "No change in the log shown below"}</div>
+                    </div>
+                    <div style={{ fontSize: 13, fontWeight: 800, whiteSpace: "nowrap", color: t.count === 0 ? "#EF4444" : "#22C55E" }}>{t.count === 0 ? (t.missing ? "⚠️ MISSING" : "⚠️ EMPTY") : `${t.count.toLocaleString("en-IN")} ${t.unit}`}</div>
+                  </div>
+                ))}
+                <div style={{ fontSize: 11, color: "#8888AA", marginTop: 8, lineHeight: 1.5 }}>Counts are as loaded when this device opened the app. Reload the page to re-check.</div>
+              </Card>
+
+              <Card style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                  <div style={{ fontSize: 13, color: "#8888AA", fontWeight: 600 }}>ACTIVITY LOG</div>
+                  <button onClick={() => loadSysLog()} disabled={sysLoading} style={{ background: "#6C63FF22", border: "none", color: "#6C63FF", borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: sysLoading ? "wait" : "pointer" }}>{sysLoading ? "Loading…" : "🔄 Refresh"}</button>
+                </div>
+                <div style={{ fontSize: 11, color: "#8888AA", marginBottom: 10, lineHeight: 1.5 }}>Every save made through this app. Shows the latest 200 entries, or everything for the member or dates chosen below. Changes made outside the app are not recorded.</div>
+                <div style={{ fontSize: 11, color: "#8888AA", fontWeight: 600, marginBottom: 4 }}>MEMBER</div>
+                <select aria-label="Member" value={sysActor} onChange={e => { const v = e.target.value; setSysActor(v); if (v !== "all") setSysOrder("asc"); loadSysLog({ actor: v }); }} style={{ ...inputStyle, fontSize: 13, padding: "10px 10px", marginBottom: 8 }}>
+                  <option value="all">All members</option>
+                  {[...users].sort((a, b) => (a.slNo || 0) - (b.slNo || 0)).map(u => <option key={u.id} value={u.id}>#{u.slNo !== undefined ? u.slNo : "—"} {u.name}</option>)}
+                  {formerActors.map(x => <option key={x.id} value={x.id}>{x.name} (removed member, {x.id})</option>)}
+                  <option value="none">Not logged in</option>
+                </select>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, color: "#8888AA", fontWeight: 600, marginBottom: 4 }}>FROM</div>
+                    <input aria-label="From date" type="date" value={sysFrom} max={sysTo || undefined} onChange={e => { setSysFrom(e.target.value); loadSysLog({ from: e.target.value }); }} style={{ ...inputStyle, fontSize: 13, padding: "10px 10px" }} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, color: "#8888AA", fontWeight: 600, marginBottom: 4 }}>TO</div>
+                    <input aria-label="To date" type="date" value={sysTo} min={sysFrom || undefined} onChange={e => { setSysTo(e.target.value); loadSysLog({ to: e.target.value }); }} style={{ ...inputStyle, fontSize: 13, padding: "10px 10px" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  <select aria-label="Order" value={sysOrder} onChange={e => setSysOrder(e.target.value)} style={{ ...inputStyle, flex: 1, fontSize: 13, padding: "10px 10px" }}>
+                    <option value="desc">Newest first</option>
+                    <option value="asc">Oldest first</option>
+                  </select>
+                  {(sysActor !== "all" || sysFrom || sysTo || sysTable !== "all" || sysText) && (
+                    <button onClick={() => { setSysActor("all"); setSysFrom(""); setSysTo(""); setSysTable("all"); setSysText(""); setSysOrder("desc"); loadSysLog({ actor: "all", from: "", to: "" }); }} style={{ background: "#2A2D3A", border: "none", color: "#F0F0F5", borderRadius: 10, padding: "0 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Clear filters</button>
+                  )}
+                </div>
+                <select aria-label="Type of activity" value={sysTable} onChange={e => setSysTable(e.target.value)} style={{ ...inputStyle, fontSize: 13, padding: "10px 10px", marginBottom: 8 }}>
+                  <option value="all">All activity</option>
+                  <option value="deletes">Deletions only</option>
+                  <option value="problems">Problems only (failed, blocked, empty, large drops)</option>
+                  <option value="signin">Sign-ins</option>
+                  {Object.entries(TABLES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                </select>
+                <input value={sysText} onChange={e => setSysText(e.target.value)} placeholder="Filter by member or text" style={{ ...inputStyle, fontSize: 13, padding: "10px 10px" }} />
+                {sysError && <div role="alert" style={{ marginTop: 10, fontSize: 12, color: "#EF4444", fontWeight: 600 }}>{sysError}</div>}
+              </Card>
+
+              {sysLog !== null && !sysError && (
+                <div style={{ fontSize: 12, color: "#8888AA", margin: "0 4px 8px", lineHeight: 1.5 }}>
+                  {actorLabel && <div style={{ color: "#F0F0F5", fontWeight: 700, fontSize: 13 }}>Activity of {actorLabel}</div>}
+                  <div>{rows.length} of {sysLog.length} entries{sysFrom || sysTo ? ` · ${sysFrom ? when(sysFrom + "T00:00:00").slice(0, 11) : "start"} to ${sysTo ? when(sysTo + "T00:00:00").slice(0, 11) : "today"}` : ""} · {sysOrder === "asc" ? "oldest first" : "newest first"}</div>
+                  {sysCapped && <div style={{ color: "#F59E0B", fontWeight: 600 }}>⚠ This view reached its limit, so older or other entries may be missing. Narrow the dates to see everything.</div>}
+                </div>
+              )}
+              {sysLog !== null && rows.length === 0 && !sysError && (
+                <Card><div style={{ fontSize: 13, color: "#8888AA" }}>{sysLog.length === 0 ? "No activity recorded yet." : "No entries match this filter."}</div></Card>
+              )}
+              {ordered.map((e, idx) => {
+                const [typeLabel, typeColor] = TYPES[e.type] || [e.type || "Event", "#8888AA"];
+                const day = dayOf(e.ts);
+                const newDay = idx === 0 || dayOf(ordered[idx - 1].ts) !== day;
+                return (
+                  <div key={e.id}>
+                  {newDay && <div style={{ fontSize: 12, fontWeight: 700, color: "#6C63FF", margin: "12px 4px 6px" }}>{day} · {dayCounts[day]} {dayCounts[day] === 1 ? "entry" : "entries"}</div>}
+                  <Card style={{ marginBottom: 8, padding: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>
+                        <span style={{ color: typeColor }}>{typeLabel}</span>{e.table ? <span style={{ color: "#F0F0F5" }}> · {TABLES[e.table] || e.table}</span> : null}
+                        {e.bigDrop && <span style={{ marginLeft: 8, background: "#F59E0B22", color: "#F59E0B", borderRadius: 6, padding: "2px 7px", fontSize: 11, fontWeight: 700 }}>⚠ large drop</span>}
+                        {e.removals > 0 && <span style={{ marginLeft: 8, background: "#EF444422", color: "#EF4444", borderRadius: 6, padding: "2px 7px", fontSize: 11, fontWeight: 700 }}>🗑 {e.removals} deleted{e.type === "save_failed" || e.type === "blocked" ? " (not applied)" : ""}</span>}
+                      </div>
+                      <div style={{ fontSize: 11, color: "#8888AA", whiteSpace: "nowrap" }}>{when(e.ts)}</div>
+                    </div>
+                    <div style={{ fontSize: 12, color: "#8888AA", marginTop: 2 }}>by <b style={{ color: "#F0F0F5" }}>{e.actorName || "unknown"}</b>{e.actorId ? ` (${e.actorId})` : ""}</div>
+                    {(e.changes || []).length > 0 && (
+                      <div style={{ marginTop: 6, fontSize: 12, color: "#F0F0F5", lineHeight: 1.6, wordBreak: "break-word" }}>
+                        {e.changes.map((c, i) => <div key={i}>• {pretty(c)}</div>)}
+                        {e.truncated && <div style={{ color: "#8888AA" }}>…and more changes not listed</div>}
+                      </div>
+                    )}
+                    {e.type === "save" && (e.changes || []).length === 0 && <div style={{ marginTop: 6, fontSize: 12, color: "#8888AA" }}>Saved with no change to the contents.</div>}
+                    {e.error && <div style={{ marginTop: 6, fontSize: 12, color: "#EF4444" }}>Error: {e.error}</div>}
+                    <details style={{ marginTop: 6, fontSize: 11, color: "#8888AA" }}>
+                      <summary style={{ cursor: "pointer" }}>Details</summary>
+                      <div style={{ marginTop: 4, lineHeight: 1.6, wordBreak: "break-all" }}>
+                        {e.beforeSize !== undefined && e.beforeSize !== null && <div>Items: {e.beforeSize} → {e.afterSize}</div>}
+                        <div>Page: {e.url || "—"}</div>
+                        <div>App build: {e.build || "—"}</div>
+                        <div>Device: {e.device || "—"}</div>
+                        <div>Device clock: {e.clientTs || "—"}</div>
+                      </div>
+                    </details>
+                  </Card>
+                  </div>
+                );
+              })}
+            </>
+          );
+        })()}
       </div>
       <Nav screen={screen} session={session} setScreen={setScreen} setSession={setSession} />
     </div>

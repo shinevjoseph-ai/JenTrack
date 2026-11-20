@@ -11,6 +11,7 @@ const prodConfig = {
   appId: "1:175159103975:web:ee0582dfa37730d2942d42"
 };
 
+
 // ── DESTINATION (QA) ─────────────────────────────────────────────
 const qaConfig = {
   apiKey: "AIzaSyB3AbNtUac5rHATF3W2glXIBsivBXwEThg",
@@ -26,18 +27,29 @@ const qaApp   = initializeApp(qaConfig,   "qa");
 const prodDb  = getFirestore(prodApp);
 const qaDb    = getFirestore(qaApp);
 
+
+const SourceDB1 = "attendance";
+const BakDB1 = "attendance2";
+//const BakDB1 = "JENtrack-qa";
+
 const KEYS = ["att:users", "att:records", "att:departments"];
 
+  console.log("");
+  console.log("🎉  >>  DB Backup Started from.. " + SourceDB1);
+  console.log("");
 for (const key of KEYS) {
   //const snap = await getDoc(doc(prodDb, "attendance", key));
-  const snap = await getDoc(doc(prodDb, "attendance", key));
+  const snap = await getDoc(doc(prodDb, SourceDB1, key));
   if (snap.exists()) {
-    await setDoc(doc(qaDb, "JENtrack-qa", key), snap.data());
+    await setDoc(doc(qaDb, BakDB1, key), snap.data());
     //await setDoc(doc(qaDb, "attendance2", key), snap.data());
-    console.log(`✅ Copied ${key}`);
+    console.log(`✅ Copied table : ${key}`);
   } else {
     console.log(`⚠️  ${key} not found in prod — skipping`);
   }
 }
 
+console.log("");
+console.log("  >>  From Database.. " + SourceDB1 +"  To >>  " + BakDB1);
+console.log("");
 console.log("🎉 Database copy complete!");

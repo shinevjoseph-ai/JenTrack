@@ -29,9 +29,13 @@ const destDb    = getFirestore(destApp);
 // ── Collection + document keys to copy ───────────────────────────
 // Update this if your collection name or document keys are different
 const srcCOLLECTION = "attendance";
-const destCOLLECTION = "JENtrack-qa";
+//const destCOLLECTION = "JENtrack-qa";
+const destCOLLECTION = "attendance2";
 
-const DOC_KEYS = [
+
+const DOC_KEYS = [  
+  "att:meetingdates", 
+  "att:userauditlog", 
   "att:users",
   "att:records",
   "att:departments",
@@ -61,3 +65,6 @@ for (const key of DOC_KEYS) {
 }
 
 console.log(`\n🎉 Done! ${copied} table(s) copied, ${skipped} skipped (not found).`);
+
+
+// node .\DB_Scripts\copy-all-tables.js

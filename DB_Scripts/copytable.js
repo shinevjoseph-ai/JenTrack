@@ -17,7 +17,7 @@ const db  = getFirestore(app);
 const SOURCE_COLLECTION = "attendance2";
 const DEST_COLLECTION   = "attendance";
 const DOC_ID            = "att:users";
- 
+
 const snap = await getDoc(doc(db, SOURCE_COLLECTION, DOC_ID));
  
 if (snap.exists()) {
@@ -26,3 +26,5 @@ if (snap.exists()) {
 } else {
   console.log(`⚠️  ${DOC_ID} not found in "${SOURCE_COLLECTION}"`);
 }
+
+// node .\DB_Scripts\copytable.js   
